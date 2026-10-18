@@ -174,20 +174,30 @@ def check_name(op: str, filename: str) -> Response | None:
     return None
 
 
+async def io(fn, *args):
+    """Run blocking file I/O in a thread with a timeout: a hung NFS mount never blocks the event loop."""
+    return await asyncio.wait_for(asyncio.to_thread(fn, *args), IO_TIMEOUT_S)
+
+
 async def disk(op: str, fn, *args):
     start = time.perf_counter()
     try:
-        return await asyncio.wait_for(asyncio.to_thread(fn, *args), IO_TIMEOUT_S)
+        return await io(fn, *args)
     finally:
         OP_SECONDS.labels(op).observe(time.perf_counter() - start)
 
 
-def _write(path: Path, data: bytes) -> int:
-    old = path.stat().st_size if path.exists() else 0
+def _size_or_none(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return None
+
+
+def _write(path: Path, data: bytes) -> None:
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     tmp.write_bytes(data)
     os.replace(tmp, path)   # atomic: readers never see a half-written file
-    return old
 
 
 def _delete(path: Path) -> int:
@@ -221,18 +231,24 @@ async def storage_write(body: WriteIn):
         return result(op, 413, {"error": {"code": "TooLarge", "message": f"max {MAX_WRITE_BYTES} bytes per write"}})
     path = FILES_DIR / body.filename
     async with write_lock:
-        existing = path.stat().st_size if path.exists() else 0
-        if used_bytes - existing + body.size_bytes > QUOTA_BYTES:
+        try:
+            existing = await io(_size_or_none, path)
+        except Exception as exc:
+            return result(op, 500, {"error": {"code": "IOError", "message": str(exc) or exc.__class__.__name__}})
+        if used_bytes - (existing or 0) + body.size_bytes > QUOTA_BYTES:
             return result(op, 507, {"error": {"code": "QuotaExceeded",
                                               "message": "Simulated quota exceeded",
                                               "used_bytes": used_bytes, "capacity_bytes": QUOTA_BYTES}})
         try:
-            old = await disk(op, _write, path, os.urandom(body.size_bytes))
+            await disk(op, _write, path, os.urandom(body.size_bytes))
         except Exception as exc:
             log.error("write failed", extra={"fields": {"file": body.filename, "error": f"{exc.__class__.__name__}: {exc}"}})
             return result(op, 500, {"error": {"code": "IOError", "message": str(exc) or exc.__class__.__name__}})
-        used_bytes += body.size_bytes - old
+        used_bytes += body.size_bytes - (existing or 0)
         USED.set(used_bytes)
+        if existing is None:            # new file (overwrite keeps the count)
+            state["files"] += 1
+            FILES.set(state["files"])
     return result(op, 201, {"filename": body.filename, "size_bytes": body.size_bytes, "used_bytes": used_bytes})
 
 
@@ -266,6 +282,8 @@ async def storage_delete(filename: str):
             return result(op, 500, {"error": {"code": "IOError", "message": str(exc) or exc.__class__.__name__}})
         used_bytes -= size
         USED.set(used_bytes)
+        state["files"] -= 1
+        FILES.set(state["files"])
     return result(op, 204)
 
 
